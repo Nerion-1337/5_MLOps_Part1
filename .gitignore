@@ -11,3 +11,8 @@ data/processed/
 
 # Virtual environments
 .venv
+
+# MLflow tracking and database
+metadata.db
+mlruns/
+mlartifacts/
