@@ -11,10 +11,11 @@ import streamlit as st
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # --- 2. CONFIGURATION STREAMLIT ---
-st.set_page_config(page_title="Futurisys - Credit Scoring", layout="wide")
+st.set_page_config(page_title="Prêt à dépenser - Scoring Crédit", layout="wide")
 st.title("📊 Outil d'Aide à la Décision - Octroi de Crédit")
 
-# --- 3. CHARGEMENT DU MODÈLE ---
+
+# --- 3. CHARGEMENT DU MODÈLE ET DES DONNÉES ---
 @st.cache_resource
 def load_model_and_data():
     db_path = BASE_DIR / "data" / "mlflow" / "metadata.db"
@@ -34,7 +35,7 @@ def load_model_and_data():
 
     clean_source = urllib.parse.unquote(raw_source).replace("\\", "/")
 
-    # 2. Localisation du dossier physique
+    # 2. Localisation du dossier physique (Scan récursif)
     local_model_path = None
     folder_ids = [run_id]
     parts = [p for p in clean_source.split("/") if p.startswith("m-") or len(p) == 32]
@@ -55,26 +56,22 @@ def load_model_and_data():
         st.error("🚨 Impossible de trouver le dossier physique du modèle sur le disque.")
         st.stop()
 
-    # =================================================================
-    # LE FIX DÉFINITIF : URI de type fichier local (Bypass du C:)
-    # =================================================================
-    # On force la conversion du chemin en format Posix (C:/Users/...)
+    # Contournement du C: pour Windows avec file:///
     chemin_posix = local_model_path.resolve().as_posix()
-    
-    # On ajoute explicitement le protocole "file:///" 
-    # pour empêcher MLflow de croire que "C:" est un protocole web.
     model_uri = f"file:///{chemin_posix}"
     
-    print(f"✅ Chargement depuis l'URI parfaite : {model_uri}")
-    
-    # MLflow comprendra enfin que c'est un dossier local
+    print(f"✅ Chargement depuis l'URI : {model_uri}")
     model = mlflow.lightgbm.load_model(model_uri)
 
     # 3. Chargement des données
     data_path = BASE_DIR / "data" / "processed" / "X_test_sample.parquet"
-    df = pd.read_parquet(data_path)
+    if not data_path.exists():
+        st.error(f"🚨 Fichier introuvable : {data_path}")
+        st.stop()
 
+    df = pd.read_parquet(data_path)
     return model, df
+
 
 # Initialisation
 model, df_clients = load_model_and_data()
@@ -84,34 +81,24 @@ SEUIL_METIER = 0.54
 st.sidebar.header("Recherche Client")
 client_id = st.sidebar.selectbox("Sélectionnez l'ID du client :", df_clients.index)
 
-# --- 5. PRÉDICTION & DÉCISION ---
-if client_id:
-    # On récupère la ligne du client
-    client_data = df_clients.loc[[client_id]]
-    
-    # =========================================================
-    # LE FIX DATA SCIENCE : Alignement des colonnes
-    # =========================================================
-    # 1. On retire manuellement TARGET si elle a été exportée par erreur
+# --- 5. PRÉDICTION & INTERPRÉTABILITÉ ---
+if client_id is not None:
+    client_data = df_clients.loc[[client_id]].copy()
+
+    # Nettoyage et alignement strict sur les features d'entraînement
     if "TARGET" in client_data.columns:
         client_data = client_data.drop(columns=["TARGET"])
-        
-    # 2. Filtre ultime : on force client_data à avoir EXACTEMENT 
-    # les 577 colonnes (et dans le même ordre) que lors de l'entraînement
-    if hasattr(model, 'feature_name_'):
-        colonnes_attendues = model.feature_name_
-        client_data = client_data[colonnes_attendues]
-    # =========================================================
+    if hasattr(model, "feature_name_"):
+        client_data = client_data[model.feature_name_]
 
-    # Le modèle calcule la probabilité
+    # Inférence
     proba_defaut = model.predict_proba(client_data)[0][1]
 
     col1, col2 = st.columns(2)
-
     with col1:
         st.subheader("Score de Risque")
         st.metric(label="Probabilité de faillite", value=f"{proba_defaut * 100:.1f} %")
-        st.write(f"*Seuil d'acceptation strict fixé à {SEUIL_METIER * 100}%*")
+        st.write(f"*Seuil d'acceptation strict fixé à {SEUIL_METIER * 100:.0f} %*")
 
     with col2:
         st.subheader("Décision Recommandée")
@@ -120,14 +107,37 @@ if client_id:
         else:
             st.success("✅ CRÉDIT ACCORDÉ")
 
-    # --- 6. EXPLICATION LOCALE AVEC SHAP ---
+    # --- 6. ONGLETS D'INTERPRÉTABILITÉ (LOCALE & GLOBALE) ---
     st.divider()
-    st.subheader("🔍 Explication de la décision (Feature Importance Locale)")
-    st.write("Ce graphique montre l'impact des variables sur ce client précis.")
+    tab_local, tab_global = st.tabs(
+        ["🔍 Analyse Client (SHAP Local)", "📈 Feature Importance Globale"]
+    )
 
-    explainer = shap.TreeExplainer(model)
-    shap_values = explainer(client_data)
+    with tab_local:
+        st.subheader(f"Facteurs d'influence pour le client {client_id}")
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer(client_data)
 
-    fig, ax = plt.subplots(figsize=(8, 4))
-    shap.plots.waterfall(shap_values[0], show=False)
-    st.pyplot(fig)
+        fig_local, ax_local = plt.subplots(figsize=(9, 4.5))
+        shap.plots.waterfall(shap_values[0], max_display=15, show=False)
+        plt.tight_layout()
+        st.pyplot(fig_local)
+        plt.close(fig_local)
+
+    with tab_global:
+        st.subheader("Top 20 des variables les plus déterminantes")
+        feature_names = model.feature_name_ if hasattr(model, "feature_name_") else client_data.columns
+        importances = model.feature_importances_
+
+        df_feat_imp = (
+            pd.DataFrame({"Feature": feature_names, "Importance": importances})
+            .sort_values(by="Importance", ascending=False)
+            .head(20)
+        )
+
+        fig_global, ax_global = plt.subplots(figsize=(9, 5.5))
+        ax_global.barh(df_feat_imp["Feature"][::-1], df_feat_imp["Importance"][::-1], color="#1f77b4")
+        ax_global.set_xlabel("Nombre de divisions (Splits)")
+        plt.tight_layout()
+        st.pyplot(fig_global)
+        plt.close(fig_global)
