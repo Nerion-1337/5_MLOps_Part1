@@ -27,6 +27,8 @@ def load_model_and_data():
     # 1. Infos du modèle en Prod
     try:
         version_prod = client.get_model_version_by_alias("CreditScoringModel", "prod")
+        SEUIL_METIER = float(version_prod.tags.get("optimal_threshold", 0.5))
+        
         raw_source = version_prod.source
         run_id = version_prod.run_id
     except Exception:
